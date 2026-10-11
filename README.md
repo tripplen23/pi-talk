@@ -20,7 +20,7 @@ v2 Realtime). No floating bubbles, no menu bar app, no notifications.
 pi install git:github.com/tripplen23/pi-talk
 ```
 
-Or copy `index.ts` to `~/.pi/agent/extensions/dictate/index.ts`.
+Or copy `index.ts` to `~/.pi/agent/extensions/pi-talk/index.ts`.
 
 ## One-time setup
 
@@ -76,9 +76,3 @@ Knobs at the top of `index.ts`:
 - **"ElevenLabs token error"** — bad/expired key, or no network to api.elevenlabs.io.
 - **`alt+m` inserts `µ`** — your terminal isn't treating Option as Alt.
 - **Debug:** run pi with `DICTATE_DEBUG=1` → appends events to `/tmp/dictate-debug.log`.
-
-## Notes
-
-Fork of [amosblomqvist/pi-dictate](https://github.com/amosblomqvist/pi-dictate)
-(MIT), with the speech-to-text backend swapped from Deepgram Nova-3 to
-ElevenLabs Scribe v2 Realtime. MIT-licensed — see `LICENSE`.
