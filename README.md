@@ -1,4 +1,8 @@
-# dictate (ElevenLabs)
+# pi-talk
+
+<p align="center">
+  <img src="assets/hero.png" alt="pi-talk — voice dictation for pi" width="100%">
+</p>
 
 Minimal voice dictation for pi, backed by **ElevenLabs Realtime STT** (Scribe
 v2 Realtime). No floating bubbles, no menu bar app, no notifications.
@@ -13,7 +17,7 @@ v2 Realtime). No floating bubbles, no menu bar app, no notifications.
 ## Install
 
 ```bash
-pi install git:github.com/<you>/pi-dictate-elevenlabs
+pi install git:github.com/tripplen23/pi-talk
 ```
 
 Or copy `index.ts` to `~/.pi/agent/extensions/dictate/index.ts`.
