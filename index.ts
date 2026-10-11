@@ -1,0 +1,589 @@
+/**
+ * dictate — minimal voice dictation for pi.
+ *
+ * Press alt+m to start, press it again to stop.
+ * Press alt+n to cancel and discard the in-flight transcript.
+ *
+ * Focus-aware: alt+m/alt+n are intercepted at the TUI input layer (before any
+ * focused component), so dictation works inside ANY dialog — quiz popups,
+ * ask_user_question, ctx.ui.editor()/input() — not just the main chat editor.
+ *
+ * Start rule: dictation only begins if some text-capable component is
+ * focused; otherwise an ephemeral notification explains why nothing happened.
+ * Opaque dialogs (quiz/ask selects) count as text-capable, but their internal
+ * focus is invisible to us — Tab into the note/Other field first so the text
+ * lands there.
+ *
+ * Stop rule: the delivery target is resolved fresh at stop time and the
+ * transcript goes to whatever is focused THEN (editor-like components get a
+ * direct setText append; opaque components get synthetic keystrokes). If
+ * nothing text-capable is focused at stop, the transcript is copied to the
+ * clipboard and a notification says so — a finished dictation is never lost.
+ *
+ * Requires:
+ *   - sox installed (`brew install sox` — provides the `rec` command)
+ *   - ELEVENLABS_API_KEY environment variable set
+ *
+ * Streaming model: audio is sent to ElevenLabs Realtime STT (Scribe v2
+ * Realtime) while you talk; the server emits committed transcripts per
+ * segment (VAD-committed on silence). We collect those and inject the
+ * concatenated text on stop. Partial transcripts are ignored, so the editor
+ * never shows revisable text.
+ */
+
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { Key, matchesKey, isKeyRelease, isKeyRepeat } from "@earendil-works/pi-tui";
+import { spawn, type ChildProcessByStdio } from "node:child_process";
+import type { Readable } from "node:stream";
+import { appendFileSync } from "node:fs";
+
+// Optional forensic logging: run pi with DICTATE_DEBUG=1 to append timestamped
+// lifecycle events (listener hits, toggles, ws open/error/close with their
+// generation) to /tmp/dictate-debug.log.
+const DEBUG = !!process.env.DICTATE_DEBUG;
+const dbg = (msg: string) => {
+  if (!DEBUG) return;
+  try {
+    appendFileSync("/tmp/dictate-debug.log", `${new Date().toISOString()} ${msg}\n`);
+  } catch {}
+};
+
+// ElevenLabs Realtime STT endpoint (Scribe v2 Realtime). Tuning notes:
+//   model_id=scribe_v2_realtime — realtime model, sub-second latency
+//   audio_format=pcm_16000      — raw 16-bit PCM (what sox/rec gives us)
+//   commit_strategy=vad         — auto-commit a segment on silence
+//   vad_silence_threshold_secs  — silence before a segment is committed
+//
+// Auth cannot use a WebSocket subprotocol, so we append a short-lived
+// single-use token (minted with ELEVENLABS_API_KEY) as a query parameter at
+// connect time. See startDictation().
+const EL_STT_URL =
+  "wss://api.elevenlabs.io/v1/speech-to-text/realtime" +
+  "?model_id=scribe_v2_realtime" +
+  "&audio_format=pcm_16000" +
+  "&commit_strategy=vad" +
+  "&vad_silence_threshold_secs=0.6";
+
+type State = "idle" | "recording" | "stopping";
+
+// ── Focus-aware delivery ──────────────────────────────────────────────────
+// The TUI handle is captured once via a zero-height widget factory (the only
+// extension-API surface that exposes it). With it we can:
+//   1. Listen to ALL terminal input via tui.addInputListener — listeners run
+//      before the focused component, so alt+m works even while a custom
+//      dialog has stolen focus from the main editor (extension shortcuts are
+//      otherwise only matched by the main editor component).
+//   2. Inspect tui.focusedComponent to decide where the transcript goes.
+// `focusedComponent` is declared private in the typings but is a plain
+// runtime property — a benign peek, easily patched if pi internals change.
+interface EditorLike {
+  getText(): string;
+  setText(text: string): void;
+}
+type Target =
+  | { kind: "editor"; editor: EditorLike }
+  | { kind: "typable"; component: { handleInput(data: string): void } };
+
+const asEditorLike = (value: any): EditorLike | null =>
+  value && typeof value.getText === "function" && typeof value.setText === "function" ? value : null;
+
+// Same braille frames pi-tui's Loader uses.
+const SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+const SPINNER_INTERVAL_MS = 80;
+
+// Audio meter — a tiny rolling waveform rendered in the status row while recording.
+// Tweakable knobs:
+//   METER_CELLS       = how many bars wide
+//   METER_TICK_MS     = how often bars shift left (smaller = snappier, more renders)
+//   METER_FLOOR_DB    = level at which the bar is empty (more negative = more sensitive)
+//   METER_CEILING_DB  = level at which the bar is full (less negative = needs louder to peg)
+const METER_CELLS = 6;
+const METER_TICK_MS = 60;
+const PEAK_BLOCKS = ["▁", "▂", "▃", "▄", "▅", "▆", "▇", "█"];
+// const PEAK_BLOCKS = ["⠀", "⣀", "⣄", "⣤", "⣦", "⣶", "⣷", "⣿"];
+const METER_FLOOR_DB = -50;
+const METER_CEILING_DB = -10;
+
+/** Compute normalized RMS (0..1) over a buffer of signed 16-bit little-endian PCM samples. */
+function rmsFromPcm16(buf: Buffer): number {
+  const sampleCount = Math.floor(buf.length / 2);
+  if (sampleCount === 0) return 0;
+  let sumSquares = 0;
+  for (let i = 0; i < sampleCount * 2; i += 2) {
+    const s = buf.readInt16LE(i);
+    sumSquares += s * s;
+  }
+  return Math.sqrt(sumSquares / sampleCount) / 32768;
+}
+
+/** Map a normalized RMS value to one of PEAK_BLOCKS by converting to dB and clamping into the visible range. */
+function rmsToBlock(rms: number): string {
+  if (rms <= 0) return PEAK_BLOCKS[0]!;
+  const db = 20 * Math.log10(rms);
+  const t = Math.max(0, Math.min(1, (db - METER_FLOOR_DB) / (METER_CEILING_DB - METER_FLOOR_DB)));
+  const idx = Math.floor(t * (PEAK_BLOCKS.length - 1));
+  return PEAK_BLOCKS[idx]!;
+}
+
+export default function (pi: ExtensionAPI) {
+  let state: State = "idle";
+  let rec: ChildProcessByStdio<null, Readable, Readable> | null = null;
+  let ws: WebSocket | null = null;
+  let finals: string[] = [];
+  let activeCtx: ExtensionContext | null = null;
+  let flushed = false;
+  let cancelled = false;
+  let stopTimeout: NodeJS.Timeout | null = null;
+  let spinnerTimer: NodeJS.Timeout | null = null;
+  let spinnerFrame = 0;
+  // Session generation: incremented on every start and every cleanup. All
+  // rec/ws event handlers capture the generation they belong to and no-op
+  // when it's stale — otherwise a PREVIOUS session's socket erroring/closing
+  // late (e.g. one we aborted mid-handshake) would run cleanup() and tear
+  // down the CURRENT live session.
+  let generation = 0;
+  // Audio meter state. `meter` is a ring of recent RMS values, newest at
+  // index METER_CELLS-1. `currentLevel` is the most recent RMS observed from
+  // any audio chunk — the meter tick just samples it. Crucially we never reset
+  // it: empty ticks re-render the last observed value, so the bars never drop
+  // to silence just because no chunk happened to arrive in that 60ms window.
+  let meterTimer: NodeJS.Timeout | null = null;
+  let meter: number[] = new Array(METER_CELLS).fill(0);
+  let currentLevel = 0;
+
+  const setStatus = (msg: string | undefined) => {
+    if (!activeCtx) return;
+    activeCtx.ui.setStatus("dictate", msg);
+  };
+
+  const stopSpinner = () => {
+    if (spinnerTimer) {
+      clearInterval(spinnerTimer);
+      spinnerTimer = null;
+    }
+  };
+
+  const stopMeter = () => {
+    if (meterTimer) {
+      clearInterval(meterTimer);
+      meterTimer = null;
+    }
+  };
+
+  /** Start the meter ticking. Each tick shifts the ring and samples currentLevel. */
+  const startMeter = () => {
+    stopMeter();
+    meter = new Array(METER_CELLS).fill(0);
+    currentLevel = 0;
+    // Recording dot: a text glyph colored via the theme, not an emoji — emoji
+    // presentation renders double-width in its own baked-in color and visually
+    // shouts in the footer. `●` is the same dot pi's own docs use for
+    // indicators; theme "error" gives the red. (If you ever want strictly
+    // ASCII, swap the glyph for "O".)
+    const render = () => {
+      const dot = activeCtx?.ui.theme.fg("error", "●") ?? "●";
+      setStatus(`${dot} ${meter.map(rmsToBlock).join("")} listening…`);
+    };
+    render();
+    meterTimer = setInterval(() => {
+      meter.shift();
+      meter.push(currentLevel);
+      render();
+    }, METER_TICK_MS);
+  };
+
+  /** Animate the dictate status row with a braille spinner + suffix message. */
+  const startSpinner = (suffix: string) => {
+    stopSpinner();
+    spinnerFrame = 0;
+    setStatus(`${SPINNER_FRAMES[0]} ${suffix}`);
+    spinnerTimer = setInterval(() => {
+      spinnerFrame = (spinnerFrame + 1) % SPINNER_FRAMES.length;
+      setStatus(`${SPINNER_FRAMES[spinnerFrame]} ${suffix}`);
+    }, SPINNER_INTERVAL_MS);
+  };
+
+  let tuiHandle: any = null;
+  let removeInputListener: (() => void) | null = null;
+  let lastCtx: ExtensionContext | null = null;
+
+  /** Resolve where dictated text would go RIGHT NOW, based on keyboard focus. */
+  const resolveTarget = (): Target | null => {
+    const focused = tuiHandle?.focusedComponent;
+    if (!focused) return null;
+    // Editor-like focus: the main chat editor, custom editors, and the
+    // ctx.ui.editor()/input() popups (their inner pi-tui Editor hangs off
+    // `.editor`). These accept a guaranteed direct setText append.
+    const editor = asEditorLike(focused) ?? asEditorLike(focused.editor);
+    if (editor) return { kind: "editor", editor };
+    // Opaque component with input handling (quiz/ask selects, selectors):
+    // we can type into it, but whether the text lands depends on its
+    // internal focus (e.g. the quiz note field must be Tab-focused).
+    if (typeof focused.handleInput === "function") return { kind: "typable", component: focused };
+    return null;
+  };
+
+  const flush = () => {
+    if (flushed || !activeCtx) return;
+    flushed = true;
+    if (cancelled) return; // discard transcript on cancel
+    const text = finals.join(" ").replace(/\s+/g, " ").trim();
+    if (!text) return;
+
+    // Legacy fallback: no TUI handle captured (non-TUI mode / older pi) —
+    // append to the main chat editor exactly as before.
+    if (!tuiHandle) {
+      const current = activeCtx.ui.getEditorText() ?? "";
+      const sep = current && !/\s$/.test(current) ? " " : "";
+      activeCtx.ui.setEditorText(current + sep + text);
+      return;
+    }
+
+    // Resolve the target NOW — focus may have changed while dictating.
+    const target = resolveTarget();
+    if (target?.kind === "editor") {
+      const current = target.editor.getText() ?? "";
+      const sep = current && !/\s$/.test(current) ? " " : "";
+      target.editor.setText(current + sep + text);
+      tuiHandle.requestRender?.();
+      return;
+    }
+    if (target?.kind === "typable") {
+      // Synthetic typing: the component routes the text wherever its
+      // internal focus is. Text is plain printable words (whitespace
+      // already normalized), so no keybindings/autocomplete can trigger.
+      target.component.handleInput(text);
+      tuiHandle.requestRender?.();
+      return;
+    }
+    // Nothing to type into: don't throw the transcript away — stash it on
+    // the clipboard and say so.
+    try {
+      const p = spawn("pbcopy", [], { stdio: ["pipe", "ignore", "ignore"] });
+      p.stdin.end(text);
+    } catch {}
+    activeCtx.ui.notify("Dictation finished but no input field is focused — transcript copied to clipboard", "warning");
+  };
+
+  const cleanup = () => {
+    generation++; // invalidate the dying session's event handlers
+    dbg(`cleanup → gen ${generation}`);
+    flush();
+    stopSpinner();
+    stopMeter();
+    if (stopTimeout) {
+      clearTimeout(stopTimeout);
+      stopTimeout = null;
+    }
+    if (rec) {
+      try {
+        rec.kill("SIGTERM");
+      } catch {}
+      rec = null;
+    }
+    if (ws) {
+      try {
+        if (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING) {
+          ws.close();
+        }
+      } catch {}
+      ws = null;
+    }
+    finals = [];
+    state = "idle";
+    setStatus(undefined);
+    activeCtx = null;
+    flushed = false;
+    cancelled = false;
+  };
+
+  const startDictation = async (ctx: ExtensionContext): Promise<void> => {
+    const apiKey = process.env.ELEVENLABS_API_KEY;
+    if (!apiKey) {
+      ctx.ui.notify("ELEVENLABS_API_KEY not set in environment", "error");
+      return;
+    }
+
+    activeCtx = ctx;
+    finals = [];
+    flushed = false;
+    cancelled = false;
+    state = "recording";
+    const myGeneration = ++generation;
+    dbg(`start (gen ${myGeneration})`);
+    startMeter();
+
+    // Mint a single-use realtime token (native WebSocket can't set the
+    // xi-api-key header, so authenticate via the token query parameter).
+    let token: string;
+    try {
+      const res = await fetch("https://api.elevenlabs.io/v1/single-use-token/realtime_scribe", {
+        method: "POST",
+        headers: { "xi-api-key": apiKey },
+      });
+      if (!res.ok) throw new Error(`${res.status} ${(await res.text()).slice(0, 200)}`);
+      token = ((await res.json()) as { token: string }).token;
+    } catch (e: any) {
+      ctx.ui.notify(`ElevenLabs token error: ${e?.message ?? String(e)}`, "error");
+      cleanup();
+      return;
+    }
+    if (myGeneration !== generation) return; // stopped/cancelled during mint
+
+    // Spawn sox `rec` to capture 16kHz / 16-bit / mono PCM to stdout.
+    let proc: ChildProcessByStdio<null, Readable, Readable>;
+    try {
+      proc = spawn(
+        "rec",
+        [
+          "-q", // quiet
+          // Shrink sox's IO buffer so stdout flushes ~every 16ms instead of
+          // the default ~256ms. 512 bytes = 256 samples = 16ms at 16kHz/16-bit
+          // mono. This is the dominant source of meter latency.
+          "--buffer", "512",
+          "-r", "16000",
+          "-c", "1",
+          "-b", "16",
+          "-e", "signed-integer",
+          "-t", "raw",
+          "-", // stdout
+        ],
+        { stdio: ["ignore", "pipe", "pipe"] },
+      );
+    } catch (e: any) {
+      ctx.ui.notify(`Failed to spawn 'rec'. Install sox: brew install sox`, "error");
+      cleanup();
+      return;
+    }
+    rec = proc;
+
+    proc.on("error", (err) => {
+      if (myGeneration !== generation) return;
+      ctx.ui.notify(`rec error: ${err.message} (install sox: brew install sox)`, "error");
+      cleanup();
+    });
+
+    proc.on("exit", (code) => {
+      if (myGeneration !== generation) return; // stale recorder — a newer/ended session owns state
+      // Natural exit on SIGTERM during stopDictation is fine. Anything else
+      // mid-recording is a problem.
+      if (state === "recording" && code !== null && code !== 0) {
+        if (activeCtx) {
+          activeCtx.ui.notify(`rec exited unexpectedly (code ${code})`, "warning");
+        }
+        cleanup();
+      }
+    });
+
+    // Open the ElevenLabs Realtime STT WebSocket, authenticated via the token.
+    try {
+      ws = new WebSocket(`${EL_STT_URL}&token=${encodeURIComponent(token)}`);
+    } catch (e: any) {
+      ctx.ui.notify(`ElevenLabs WS failed: ${e.message}`, "error");
+      cleanup();
+      return;
+    }
+
+    ws.addEventListener("open", () => {
+      if (myGeneration !== generation) {
+        dbg(`ws open (stale gen ${myGeneration}, current ${generation}) — ignored`);
+        return;
+      }
+      dbg(`ws open (gen ${myGeneration})`);
+      if (!rec || !ws) return;
+      rec.stdout.on("data", (chunk: Buffer) => {
+        // Track loudness for the meter (just the latest chunk's RMS — the meter
+        // tick samples this), then forward to ElevenLabs.
+        currentLevel = rmsFromPcm16(chunk);
+        if (ws && ws.readyState === WebSocket.OPEN) {
+          ws.send(
+            JSON.stringify({
+              message_type: "input_audio_chunk",
+              audio_base_64: chunk.toString("base64"),
+              commit: false,
+              sample_rate: 16000,
+            }),
+          );
+        }
+      });
+    });
+
+    ws.addEventListener("message", (ev) => {
+      if (myGeneration !== generation) return;
+      try {
+        const msg = JSON.parse(ev.data as string);
+        const type = msg.message_type ?? msg.type;
+        if (type === "committed_transcript") {
+          const t = String(msg.text ?? "").trim();
+          if (t) finals.push(t);
+          // On stop we send a final commit; finalize as soon as it lands.
+          if (state === "stopping") {
+            cleanup();
+            return;
+          }
+        } else if (type === "partial_transcript" || type === "session_started") {
+          // ignore interim / handshake events
+        } else if (typeof type === "string" && type.includes("error")) {
+          if (activeCtx) {
+            activeCtx.ui.notify(
+              `ElevenLabs STT error: ${msg.message ?? msg.error ?? JSON.stringify(msg).slice(0, 200)}`,
+              "error",
+            );
+          }
+        }
+      } catch {
+        // ignore non-JSON frames
+      }
+    });
+
+    ws.addEventListener("error", () => {
+      if (myGeneration !== generation) {
+        dbg(`ws error (stale gen ${myGeneration}, current ${generation}) — ignored`);
+        return;
+      }
+      dbg(`ws error (gen ${myGeneration})`);
+      if (activeCtx) activeCtx.ui.notify("ElevenLabs WebSocket error", "error");
+      cleanup();
+    });
+
+    ws.addEventListener("close", (ev) => {
+      if (myGeneration !== generation) {
+        dbg(`ws close (stale gen ${myGeneration}, current ${generation}, code ${ev.code}) — ignored`);
+        return;
+      }
+      dbg(`ws close (gen ${myGeneration}, code ${ev.code})`);
+      // Server-initiated close (or our own close in cleanup): finalize.
+      if (state === "recording" || state === "stopping") {
+        cleanup();
+      }
+    });
+  };
+
+  /** Stop dictation, finalize transcript, append to editor. */
+  const stopDictation = () => {
+    if (state !== "recording") return;
+    state = "stopping";
+    stopMeter();
+    startSpinner("finalizing…");
+
+    // Stop the mic first so no more audio enqueues.
+    if (rec) {
+      try {
+        rec.kill("SIGTERM");
+      } catch {}
+    }
+
+    // Ask ElevenLabs to commit the final segment; it replies with a
+    // committed_transcript that finalizes us (see the message handler).
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      try {
+        ws.send(
+          JSON.stringify({
+            message_type: "input_audio_chunk",
+            audio_base_64: "",
+            commit: true,
+            sample_rate: 16000,
+          }),
+        );
+      } catch {
+        cleanup();
+        return;
+      }
+      // Safety net: if the final commit never lands, force cleanup after 3s.
+      stopTimeout = setTimeout(() => {
+        if (state === "stopping") cleanup();
+      }, 3000);
+    } else {
+      cleanup();
+    }
+  };
+
+  /** Cancel dictation: discard any collected transcript and tear everything down immediately. */
+  const cancelDictation = () => {
+    if (state !== "recording" && state !== "stopping") return;
+    cancelled = true;
+    finals = [];
+    // No need to wait for ElevenLabs to flush — we're throwing the result away.
+    cleanup();
+  };
+
+  /** Toggle dictation, gated on there being somewhere for the text to go. */
+  const toggleDictation = (ctx: ExtensionContext) => {
+    lastCtx = ctx;
+    if (state === "idle") {
+      if (tuiHandle && !resolveTarget()) {
+        ctx.ui.notify("No input field is focused — dictation not started", "warning");
+        return;
+      }
+      void startDictation(ctx);
+    } else if (state === "recording") {
+      stopDictation();
+    }
+    // Ignore presses during the "stopping" state — ElevenLabs is finalizing.
+  };
+
+  // Global input listener: catches alt+m/alt+n before ANY focused component,
+  // which is what makes dictation work inside dialogs. Registered once the
+  // TUI handle is captured (see session_start below).
+  const onGlobalInput = (data: string) => {
+    // Kitty flag-2 terminals send press + REPEAT + RELEASE events, and input
+    // listeners run BEFORE the TUI's release filter (that filter only guards
+    // dispatch to the focused component). matchesKey also ignores the Kitty
+    // event type. Without this guard a single physical alt+m press toggles
+    // TWICE: press starts dictation, release instantly stops it and closes
+    // the WebSocket mid-handshake — which then surfaces as
+    // "ElevenLabs WebSocket error" (and its stale error event can kill the NEXT
+    // session). Filter to press events only.
+    if (isKeyRelease(data) || isKeyRepeat(data)) return undefined;
+    if (matchesKey(data, Key.alt("m"))) {
+      dbg(`alt+m (data=${JSON.stringify(data)}) state=${state}`);
+      if (lastCtx) toggleDictation(lastCtx);
+      return { consume: true };
+    }
+    if (matchesKey(data, Key.alt("n"))) {
+      dbg(`alt+n (data=${JSON.stringify(data)}) state=${state}`);
+      cancelDictation();
+      return { consume: true };
+    }
+    return undefined;
+  };
+
+  pi.on("session_start", (_event, ctx) => {
+    lastCtx = ctx;
+    if (ctx.mode !== "tui" || tuiHandle) return;
+    // Capture the TUI handle via an invisible zero-height widget. The
+    // listener function reference is stable, so even if the factory re-runs
+    // the TUI's listener Set de-dupes it.
+    ctx.ui.setWidget("dictate-tui-handle", (tui: any) => {
+      tuiHandle = tui;
+      removeInputListener = tui.addInputListener(onGlobalInput);
+      return { render: () => [], invalidate: () => {} };
+    });
+  });
+
+  // Shortcut registrations kept as a fallback for contexts where the TUI
+  // handle was never captured (non-TUI modes, older pi): they only fire when
+  // the main editor is focused, but that's precisely the legacy path. When
+  // the listener IS installed it consumes the key first, so no double-fire.
+  pi.registerShortcut(Key.alt("m"), {
+    description: "Toggle voice dictation (ElevenLabs)",
+    handler: async (ctx) => {
+      toggleDictation(ctx);
+    },
+  });
+
+  // Dedicated cancel binding. Dictation-only — a no-op when no dictation is
+  // in flight, so it's safe to hammer without affecting anything else.
+  pi.registerShortcut(Key.alt("n"), {
+    description: "Cancel voice dictation (discard transcript)",
+    handler: async () => {
+      cancelDictation();
+    },
+  });
+
+  pi.on("session_shutdown", () => {
+    if (state !== "idle") cleanup();
+    removeInputListener?.();
+    removeInputListener = null;
+  });
+}

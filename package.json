@@ -1,0 +1,25 @@
+{
+  "name": "pi-dictate-elevenlabs",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Minimal voice dictation for pi (ElevenLabs Realtime STT, Scribe v2 Realtime)",
+  "license": "MIT",
+  "keywords": [
+    "pi-package"
+  ],
+  "pi": {
+    "extensions": [
+      "./index.ts"
+    ]
+  },
+  "scripts": {
+    "check": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-coding-agent": "^1.1.0",
+    "@earendil-works/pi-tui": "^1.1.0",
+    "@types/node": "^26.6.5",
+    "typescript": "^5.5.0"
+  }
+}
